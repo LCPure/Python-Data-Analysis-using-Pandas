@@ -1,0 +1,240 @@
+define([
+    'jquery',
+    'base/js/namespace',
+    'base/js/utils',
+    'base/js/keyboard',
+    'services/config'
+], function ($,
+             Jupyter,
+             IPython,
+             utils,
+             keyboard,
+             configmod) {
+    function load_ipython_extension() {
+
+        var kernel_json = '';
+
+        function getCourseraUserId() {
+            courseraUserId = '';
+
+            var substring = "coursera-apps";
+
+            //Add if condition
+
+            window_url = window.location.href;
+
+            if (window_url.indexOf(substring) !== -1) {
+                url = window_url;
+            } else {
+                url = "https://randomhuserid.coursera-apps.org/notebooks/Assignment%202.ipynb";
+            }
+
+            var urlComponents = [];
+
+            // This regex pattern is used for catpuring data from the URL
+            // var regex = /(?:[^\/\n]|\/\/)+/gi;
+            var regex = /.*?(?:[a-z]+).*?((?:[a-z][a-z]+))+/gi;
+            var str = url;
+            var m;
+
+            while ((m = regex.exec(str)) !== null) {
+                // This is necessary to avoid infinite loops with zero-width matches
+                if (m.index === regex.lastIndex) {
+                    regex.lastIndex++;
+                }
+
+                // add each chunk of the URL (separated by / )
+                urlComponents.push(m);
+            }
+            courseraUserId = urlComponents[0][1];
+            return courseraUserId;
+        }
+
+        var CodeCell = function (kernel, options) {
+            this.kernel = kernel || null;
+            this.notebook = options.notebook;
+            this.collapsed = false;
+            this.events = options.events;
+            this.tooltip = options.tooltip;
+            this.config = options.config;
+            this.class_config = new configmod.ConfigWithDefaults(this.config,
+                CodeCell.options_default, 'CodeCell');
+
+            // create all attributed in constructor function
+            // even if null for V8 VM optimisation
+            this.input_prompt_number = null;
+            this.celltoolbar = null;
+            this.output_area = null;
+
+            this.last_msg_id = null;
+            this.completer = null;
+
+            Cell.apply(this, [{
+                config: options.config,
+                keyboard_manager: options.keyboard_manager,
+                events: this.events
+            }]);
+
+            // Attributes we want to override in this subclass.
+            this.cell_type = "code";
+            var that = this;
+            this.element.focusout(
+                function () {
+                    that.auto_highlight();
+                }
+            );
+        };
+
+        CodeCell.options_default = {
+            cm_config: {
+                extraKeys: {
+                    "Backspace": "delSpaceToPrevTabStop",
+                },
+                mode: 'text',
+                theme: 'ipython',
+                matchBrackets: true,
+                autoCloseBrackets: true
+            },
+            highlight_modes: {
+                'magic_javascript': {'reg': ['^%%javascript']},
+                'magic_perl': {'reg': ['^%%perl']},
+                'magic_ruby': {'reg': ['^%%ruby']},
+                'magic_python': {'reg': ['^%%python3?']},
+                'magic_shell': {'reg': ['^%%bash']},
+                'magic_r': {'reg': ['^%%R']},
+                'magic_text/x-cython': {'reg': ['^%%cython']},
+            },
+        };
+
+        CodeCell.msg_cells = {};
+
+        CodeCell.prototype = Object.create(Jupyter.Cell.prototype);
+
+        var logging_extension_execute = function (stop_on_error) {
+
+            if (!this.kernel) {
+                console.log("Can't execute cell since kernel is not set.");
+                return;
+            }
+
+            if (stop_on_error === undefined) {
+                if (this.metadata !== undefined &&
+                    this.metadata.tags !== undefined) {
+                    if (this.metadata.tags.indexOf('raises-exception') !== -1) {
+                        stop_on_error = false;
+                    } else {
+                        stop_on_error = true;
+                    }
+                } else {
+                    stop_on_error = true;
+                }
+            }
+
+            this.clear_output(false, true);
+            var old_msg_id = this.last_msg_id;
+            if (old_msg_id) {
+                this.kernel.clear_callbacks_for_msg(old_msg_id);
+                delete CodeCell.msg_cells[old_msg_id];
+                this.last_msg_id = null;
+            }
+            if (this.get_text().trim().length === 0) {
+                // nothing to do
+                this.set_input_prompt(null);
+                return;
+            }
+            this.set_input_prompt('*');
+            this.element.addClass("running");
+            var callbacks = this.get_callbacks();
+
+            var courseraUserId = getCourseraUserId();
+            var courseraUrl = window.location.href;
+            var code = this.get_text();
+            var cellMetadata = this.metadata;
+            var notebookMetadata = this.notebook.metadata;
+
+            kernel_json = {
+                "user_id": courseraUserId,
+                "url": courseraUrl,
+                "cell_data": {
+                    "code": code,
+                    "cell_metadata": cellMetadata
+                },
+                "notebook_metadata": notebookMetadata,
+                "version_date": "11/09/2017",
+                "dynamodb_table": "LoggingKernel"
+            }
+
+            this.last_msg_id = this.kernel.execute(this.get_text(), callbacks, {
+                silent: false, store_history: true,
+                stop_on_error: stop_on_error
+            });
+            CodeCell.msg_cells[this.last_msg_id] = this;
+            this.render();
+            this.events.trigger('execute.CodeCell', {cell: this});
+            var that = this;
+
+            function handleFinished(evt, data) {
+                if (that.kernel.id === data.kernel.id && that.last_msg_id === data.msg_id) {
+                    that.events.trigger('finished_execute.CodeCell', {cell: that});
+                    that.events.off('finished_iopub.Kernel', handleFinished);
+                }
+            }
+
+            this.events.on('finished_iopub.Kernel', handleFinished);
+        };
+
+        function appendToKernelJson(key_name, data) {
+            kernel_json[key_name] = data;
+            sendKernelJsonToLoggingDatabase(kernel_json);
+        }
+
+        function sendKernelJsonToLoggingDatabase(data) {
+            var postUrl = 'https://api.mentoracademy.org/log';
+
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', postUrl, true);
+
+            xhr.setRequestHeader('Content-type', 'application/json');
+            xhr.send(JSON.stringify(data));
+
+        }
+
+        var logging_extension_get_callbacks = function () {
+            var that = this;
+            return {
+                clear_on_done: false,
+                shell: {
+                    reply: $.proxy(this._handle_execute_reply, this),
+                    payload: {
+                        set_next_input: $.proxy(this._handle_set_next_input, this),
+                        page: $.proxy(this._open_with_pager, this)
+                    }
+                },
+                iopub: {
+                    output: function (data) {
+                        appendToKernelJson('kernel_output', data);
+                        that.events.trigger('set_dirty.Notebook', {value: true});
+                        that.output_area.handle_output.apply(that.output_area, arguments);
+                    },
+                    clear_output: function () {
+                        that.events.trigger('set_dirty.Notebook', {value: true});
+                        that.output_area.handle_clear_output.apply(that.output_area, arguments);
+                    },
+                },
+                input: $.proxy(this._handle_input_request, this),
+            };
+        };
+
+        Jupyter.CodeCell.prototype.execute = function () {
+            return logging_extension_execute.call(this);
+        }
+
+        Jupyter.CodeCell.prototype.get_callbacks = function () {
+            return logging_extension_get_callbacks.call(this);
+        }
+    }
+
+    return {
+        load_ipython_extension: load_ipython_extension
+    };
+});
